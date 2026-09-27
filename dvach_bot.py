@@ -141,8 +141,103 @@ logger = logging.getLogger("dvach_bot")
 
 
 # ------------------------- STATE -------------------------
+#
+# Два режима хранения state.json:
+#   1. Локальный файл (по умолчанию) — как было всегда, для VPS/Termux, где
+#      файловая система персистентна между перезапусками.
+#   2. GitHub Gist — включается заданием DVACH_GIST_TOKEN (Personal Access
+#      Token со скоупом "gist"). Нужен для хостинга на Render и подобных
+#      платформах с эфемерной файловой системой (файлы стираются при каждом
+#      передеплое/рестарте). DVACH_GIST_ID можно не указывать при самом
+#      первом запуске — бот создаст новый приватный (secret) гист сам и
+#      выведет его ID в лог; это значение ОБЯЗАТЕЛЬНО нужно потом сохранить
+#      в переменную окружения DVACH_GIST_ID, иначе при следующем перезапуске
+#      состояние потеряется и создастся ещё один новый гист вместо этого же.
+
+GITHUB_API = "https://api.github.com"
+GIST_TOKEN = os.environ.get("DVACH_GIST_TOKEN", "").strip()
+GIST_ID = os.environ.get("DVACH_GIST_ID", "").strip()
+GIST_FILENAME = "state.json"
+USE_GIST_BACKEND = bool(GIST_TOKEN)
+
+
+def _gist_headers() -> dict:
+    return {
+        "Authorization": f"token {GIST_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "User-Agent": USER_AGENT,
+    }
+
+
+def _create_new_gist() -> str:
+    payload = {
+        "description": "dvach_bot state.json (auto-created)",
+        "public": False,
+        "files": {GIST_FILENAME: {"content": json.dumps({"mode": "preview", "threads": {}}, indent=2)}},
+    }
+    resp = requests.post(f"{GITHUB_API}/gists", headers=_gist_headers(), json=payload, timeout=15)
+    resp.raise_for_status()
+    return resp.json()["id"]
+
+
+def _load_state_from_gist() -> dict:
+    default = {"mode": "preview", "threads": {}}
+    global GIST_ID
+
+    if not GIST_ID:
+        try:
+            GIST_ID = _create_new_gist()
+            logger.warning(
+                "\n" + "=" * 72 +
+                "\nСоздан новый Gist для хранения состояния бота: %s\n"
+                "ОБЯЗАТЕЛЬНО сохрани этот ID в переменную окружения DVACH_GIST_ID —\n"
+                "иначе при следующем перезапуске состояние потеряется и создастся\n"
+                "ЕЩЁ ОДИН новый гист вместо использования уже созданного.\n" + "=" * 72,
+                GIST_ID,
+            )
+        except Exception as e:
+            logger.error("Не удалось создать новый Gist для состояния: %s", e)
+            return default
+
+    try:
+        resp = requests.get(f"{GITHUB_API}/gists/{GIST_ID}", headers=_gist_headers(), timeout=15)
+        if resp.status_code != 200:
+            logger.error("Не удалось загрузить состояние из Gist (HTTP %s): %s", resp.status_code, resp.text[:300])
+            return default
+        file_info = resp.json().get("files", {}).get(GIST_FILENAME)
+        if not file_info:
+            logger.info("В Gist %s ещё нет файла %s — стартуем с пустого состояния.", GIST_ID, GIST_FILENAME)
+            return default
+        content = file_info.get("content", "")
+        if file_info.get("truncated") and file_info.get("raw_url"):
+            # Gist API отдаёт content целиком только для файлов примерно до 1МБ;
+            # для больших файлов нужно отдельно забирать содержимое по raw_url.
+            content = requests.get(file_info["raw_url"], headers=_gist_headers(), timeout=15).text
+        data = json.loads(content) if content.strip() else default
+        data.setdefault("mode", "preview")
+        data.setdefault("threads", {})
+        return data
+    except Exception as e:
+        logger.error("Ошибка при загрузке состояния из Gist: %s", e)
+        return default
+
+
+def _save_state_to_gist(state: dict) -> None:
+    if not GIST_ID:
+        return  # создание гиста при старте не удалось — уже залогировано, не пишем в никуда
+    try:
+        payload = {"files": {GIST_FILENAME: {"content": json.dumps(state, ensure_ascii=False, indent=2)}}}
+        resp = requests.patch(f"{GITHUB_API}/gists/{GIST_ID}", headers=_gist_headers(), json=payload, timeout=15)
+        if resp.status_code != 200:
+            logger.error("Не удалось сохранить состояние в Gist (HTTP %s): %s", resp.status_code, resp.text[:300])
+    except Exception as e:
+        logger.error("Ошибка при сохранении состояния в Gist: %s", e)
+
 
 def load_state() -> dict:
+    if USE_GIST_BACKEND:
+        return _load_state_from_gist()
+
     if STATE_FILE.exists():
         try:
             data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
@@ -158,6 +253,9 @@ def load_state() -> dict:
 
 
 def save_state(state: dict) -> None:
+    if USE_GIST_BACKEND:
+        _save_state_to_gist(state)
+        return
     STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
@@ -1283,6 +1381,10 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     uptime_sec = int(time.time() - START_TIME)
     h, m, s = uptime_sec // 3600, (uptime_sec % 3600) // 60, uptime_sec % 60
     server_info = f"порт {PORT}" if PORT else "выключен"
+    if USE_GIST_BACKEND:
+        state_backend = f"GitHub Gist (<code>{GIST_ID or 'ещё не создан!'}</code>)"
+    else:
+        state_backend = "локальный файл"
 
     await update.message.reply_text(
         "<b>📊 Статус бота:</b>\n\n"
@@ -1291,6 +1393,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"• <b>Интервал опроса:</b> {POLL_INTERVAL} сек.\n"
         f"• <b>Задержка отправки:</b> {LIVE_SEND_DELAY}с (лайв) / {HISTORY_SEND_DELAY}с (история)\n"
         f"• <b>Health-сервер:</b> {server_info}\n"
+        f"• <b>Хранение состояния:</b> {state_backend}\n"
         f"• <b>Аптайм:</b> {h}ч {m}м {s}с\n"
         f"• <b>Основное зеркало:</b> {DOMAINS[0]}",
         parse_mode=ParseMode.HTML,
