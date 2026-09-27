@@ -1,4 +1,4 @@
-# 📌 Dvach Telegram Bot
+# ⚡ Dvach Telegram Bot
 
 Telegram-бот для мониторинга тредов имиджборда 2ch (Двач) и публикации постов прямо из Telegram с прикреплением медиафайлов и интерактивным решением EmojiCaptcha[cite: 3, 4].
 
