@@ -256,7 +256,11 @@ def save_state(state: dict) -> None:
     if USE_GIST_BACKEND:
         _save_state_to_gist(state)
         return
-    STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    # Пишем атомарно: сначала во временный файл рядом, затем os.replace() —
+    # так недописанный при аварийном завершении JSON не затрёт рабочий state.json.
+    tmp = STATE_FILE.with_suffix(STATE_FILE.suffix + ".tmp")
+    tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, STATE_FILE)
 
 
 STATE = load_state()
@@ -421,9 +425,19 @@ def _domain_order() -> List[str]:
     return list(DOMAINS)
 
 
+def active_domain() -> str:
+    """Домен, который последним успешно отдавал треды (иначе — основной).
+
+    Все ссылки в постах, URL медиа и адрес отправки поста строятся от него,
+    чтобы при блокировке основного зеркала бот не генерировал заведомо
+    недоступные ссылки/URL, пока сам опрос уже переключился на рабочее зеркало.
+    """
+    return _LAST_WORKING_DOMAIN or DOMAINS[0]
+
+
 def fetch_thread(board: str, thread: str) -> Optional[dict]:
     global _LAST_WORKING_DOMAIN
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    headers = {"User-Agent": USER_AGENT}
     for domain in _domain_order():
         url = f"{domain}/{board}/res/{thread}.json"
         try:
@@ -460,7 +474,7 @@ def is_full_video_send(file_obj: dict, mode: str) -> bool:
 
 
 def file_url(file_obj: dict, mode: str) -> str:
-    domain = DOMAINS[0]
+    domain = active_domain()
     if is_video(file_obj) and mode == "preview":
         return f"{domain}{file_obj['thumbnail']}"
     path = file_obj["thumbnail"] if mode == "preview" else file_obj["path"]
@@ -519,10 +533,10 @@ def _build_caption(board: str, thread: str, post: dict, msg_ids: dict, internal_
         target_msg_id = msg_ids.get(data_num)
         if target_msg_id and internal_chat_id:
             return f"https://t.me/c/{internal_chat_id}/{target_msg_id}"
-        return f"{DOMAINS[0]}/{board}/res/{thread}.html#{data_num}"
+        return f"{active_domain()}/{board}/res/{thread}.html#{data_num}"
 
     comment = clean_comment(raw_comment, resolve_ref=resolve_ref)
-    link = f"{DOMAINS[0]}/{board}/res/{thread}.html#{num}"
+    link = f"{active_domain()}/{board}/res/{thread}.html#{num}"
 
     # Имя автора (по умолчанию Аноним)
     name = clean_comment((post.get("name") or "Аноним").strip()) or "Аноним"
@@ -540,7 +554,11 @@ def _build_caption(board: str, thread: str, post: dict, msg_ids: dict, internal_
     subject_part = f"<b>{clean_comment(subject)}</b> " if subject else ""
 
     header = f'{subject_part}{name}{date_part} <a href="{link}">№{num}</a>{seq_str}'.strip()
-    caption = f"{header}\n\n{comment}".strip() if comment else header
+    # Тонкий разделитель между шапкой и телом поста — как визуальная отбивка на
+    # имиджбордах: лента постов становится заметно легче сканируется. Ставим его
+    # только когда у поста реально есть текст, иначе линия висела бы под пустым постом.
+    separator = "\n————————————————\n"
+    caption = f"{header}{separator}{comment}".strip() if comment else header
     return caption or header
 
 
@@ -608,6 +626,10 @@ async def remove_newpost_button(context: ContextTypes.DEFAULT_TYPE, info: dict) 
 
 SERVICE_MESSAGE_TTL = 10.0  # сек — через сколько самоудаляются служебные подтверждения бота
 
+# Держим ссылки на fire-and-forget задачи, иначе asyncio может собрать их сборщиком
+# мусора до завершения (см. предупреждение в документации asyncio.create_task).
+_BG_TASKS: set = set()
+
 
 def schedule_message_deletion(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int,
                                delay: float = SERVICE_MESSAGE_TTL) -> None:
@@ -618,7 +640,9 @@ def schedule_message_deletion(context: ContextTypes.DEFAULT_TYPE, chat_id: int, 
         await asyncio.sleep(delay)
         await _delete_message_silently(context, chat_id, message_id)
 
-    asyncio.create_task(_worker())
+    task = asyncio.create_task(_worker())
+    _BG_TASKS.add(task)
+    task.add_done_callback(_BG_TASKS.discard)
 
 
 async def send_post(context: ContextTypes.DEFAULT_TYPE, board: str, thread: str, post: dict, mode: str, info: dict) -> None:
@@ -673,7 +697,7 @@ async def send_post(context: ContextTypes.DEFAULT_TYPE, board: str, thread: str,
                 return
             except Exception as e:
                 logger.warning("Не удалось отправить видео %s, фолбэк на превью-картинку: %s", url, e)
-                url = f"{DOMAINS[0]}{f['thumbnail']}"  # фолбэк на превью, а не на тот же .webm/.mp4 как фото
+                url = f"{active_domain()}{f['thumbnail']}"  # фолбэк на превью, а не на тот же .webm/.mp4 как фото
 
         try:
             sent = await _send_with_reply_fallback(
@@ -1202,7 +1226,7 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     lines = ["<b>📋 Отслеживаемые треды:</b>\n"]
     for info in threads.values():
-        link = f"{DOMAINS[0]}/{info['board']}/res/{info['thread']}.html"
+        link = f"{active_domain()}/{info['board']}/res/{info['thread']}.html"
         last = info.get("last_num", "—")
         k = thread_key(info["board"], info["thread"])
         status_tag = ""
@@ -1986,7 +2010,7 @@ async def on_draft_continue(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     truncated_notice = draft.get("truncated_notice", "")
     chat_id = draft["chat_id"]
 
-    domain = DOMAINS[0]
+    domain = active_domain()
     http_s = get_dvach_session()
 
     status_msg = await query.edit_message_text(
@@ -2649,6 +2673,13 @@ def start_health_server(port: int):
 
 # ------------------------- MAIN -------------------------
 
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Глобальный обработчик необработанных исключений в хэндлерах: без него PTB
+    просто пишет traceback в лог, а мы дополнительно централизуем логирование, чтобы
+    одиночная ошибка в апдейте не роняла и не заглушала остальную обработку."""
+    logger.exception("Необработанное исключение при обработке апдейта %s: %s", update, context.error)
+
+
 def main() -> None:
     if not BOT_TOKEN or BOT_TOKEN == "ВСТАВЬ_СЮДА_ТОКЕН_БОТА":
         raise SystemExit(
@@ -2730,6 +2761,8 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.REPLY & reply_media_filter & ~filters.COMMAND, on_reply_message))
 
     app.job_queue.run_repeating(check_new_posts, interval=POLL_INTERVAL, first=5)
+
+    app.add_error_handler(on_error)
 
     logger.info(
         "Бот запущен. Опрос каждые %s сек. Тредов в базе: %s. Chat ID: %s",
