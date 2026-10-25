@@ -80,9 +80,8 @@ PRIMARY_DOMAIN = _normalize_domain(os.environ.get("DVACH_DOMAIN", "https://2ch.s
 FALLBACK_DOMAINS = [
     PRIMARY_DOMAIN,
     "https://2ch.life",
+    "https://2ch.hk",
     "https://2ch.org",
-    # Домен 2ch.hk окончательно мёртв и больше никогда не поднимется —
-    # не добавляем его ни в опрос, ни в построение URL медиа/ссылок.
 ]
 DOMAINS = list(dict.fromkeys(FALLBACK_DOMAINS))
 
@@ -420,54 +419,26 @@ def extract_referenced_nums(raw_html: str) -> List[str]:
 _LAST_WORKING_DOMAIN: Optional[str] = None
 
 
-def _domain_order(preferred: Optional[str] = None) -> List[str]:
-    """Порядок перебора зеркал: сначала домен конкретного треда (preferred),
-    затем последнее глобально рабочее зеркало, затем все остальные. Так опрос
-    и показ оригиналов начинают с того домена, с которого тред реально читается.
-    """
-    order: List[str] = []
-    for d in (preferred, _LAST_WORKING_DOMAIN):
-        if d and d in DOMAINS and d not in order:
-            order.append(d)
-    for d in DOMAINS:
-        if d not in order:
-            order.append(d)
-    return order
+def _domain_order() -> List[str]:
+    if _LAST_WORKING_DOMAIN and _LAST_WORKING_DOMAIN in DOMAINS:
+        return [_LAST_WORKING_DOMAIN] + [d for d in DOMAINS if d != _LAST_WORKING_DOMAIN]
+    return list(DOMAINS)
 
 
 def active_domain() -> str:
     """Домен, который последним успешно отдавал треды (иначе — основной).
 
-    Используется как глобальный фолбэк, когда у конкретного треда ещё не
-    зафиксирован собственный рабочий домен (см. thread_domain).
+    Все ссылки в постах, URL медиа и адрес отправки поста строятся от него,
+    чтобы при блокировке основного зеркала бот не генерировал заведомо
+    недоступные ссылки/URL, пока сам опрос уже переключился на рабочее зеркало.
     """
     return _LAST_WORKING_DOMAIN or DOMAINS[0]
 
 
-def thread_domain(info: Optional[dict]) -> str:
-    """Рабочий домен КОНКРЕТНОГО треда — тот, с которого он был добавлен и
-    реально успешно читается (.su / .org / .life). Все URL медиа и ссылки для
-    этого треда строятся от него, чтобы кнопка «Показать оригинал» и прочее не
-    обращались к зеркалу, с которого тред никогда не грузился (в частности к
-    окончательно мёртвому 2ch.hk).
-    """
-    if info:
-        d = info.get("domain")
-        if d and d in DOMAINS:
-            return d
-    return active_domain()
-
-
-def fetch_thread(board: str, thread: str, info: Optional[dict] = None) -> Optional[dict]:
-    """Качает JSON треда, перебирая зеркала. Если передан info отслеживаемого
-    треда — начинает перебор с его собственного домена и сохраняет в info["domain"]
-    то зеркало, с которого тред реально ответил. Этот домен потом используется для
-    построения всех URL медиа/ссылок именно этого треда.
-    """
+def fetch_thread(board: str, thread: str) -> Optional[dict]:
     global _LAST_WORKING_DOMAIN
     headers = {"User-Agent": USER_AGENT}
-    preferred = info.get("domain") if info else None
-    for domain in _domain_order(preferred):
+    for domain in _domain_order():
         url = f"{domain}/{board}/res/{thread}.json"
         try:
             resp = requests.get(url, timeout=12, headers=headers)
@@ -475,8 +446,6 @@ def fetch_thread(board: str, thread: str, info: Optional[dict] = None) -> Option
                 if domain != _LAST_WORKING_DOMAIN:
                     logger.info("Рабочее зеркало для запросов треда переключено на %s", domain)
                     _LAST_WORKING_DOMAIN = domain
-                if info is not None and info.get("domain") != domain:
-                    info["domain"] = domain
                 return resp.json()
         except requests.RequestException as e:
             logger.debug("Сбой запроса к %s: %s", url, e)
@@ -504,8 +473,8 @@ def is_full_video_send(file_obj: dict, mode: str) -> bool:
     return mode == "full" and is_video(file_obj)
 
 
-def file_url(file_obj: dict, mode: str, domain: Optional[str] = None) -> str:
-    domain = domain or active_domain()
+def file_url(file_obj: dict, mode: str) -> str:
+    domain = active_domain()
     if is_video(file_obj) and mode == "preview":
         return f"{domain}{file_obj['thumbnail']}"
     path = file_obj["thumbnail"] if mode == "preview" else file_obj["path"]
@@ -556,20 +525,18 @@ def _remember_msg_id(msg_ids: dict, num, message_id: int) -> None:
         del msg_ids[oldest_key]
 
 
-def _build_caption(board: str, thread: str, post: dict, msg_ids: dict, internal_chat_id: Optional[str],
-                   domain: Optional[str] = None) -> str:
+def _build_caption(board: str, thread: str, post: dict, msg_ids: dict, internal_chat_id: Optional[str]) -> str:
     num = post.get("num")
     raw_comment = post.get("comment", "")
-    domain = domain or active_domain()
 
     def resolve_ref(data_num: str) -> Optional[str]:
         target_msg_id = msg_ids.get(data_num)
         if target_msg_id and internal_chat_id:
             return f"https://t.me/c/{internal_chat_id}/{target_msg_id}"
-        return f"{domain}/{board}/res/{thread}.html#{data_num}"
+        return f"{active_domain()}/{board}/res/{thread}.html#{data_num}"
 
     comment = clean_comment(raw_comment, resolve_ref=resolve_ref)
-    link = f"{domain}/{board}/res/{thread}.html#{num}"
+    link = f"{active_domain()}/{board}/res/{thread}.html#{num}"
 
     # Имя автора (по умолчанию Аноним)
     name = clean_comment((post.get("name") or "Аноним").strip()) or "Аноним"
@@ -683,8 +650,7 @@ async def send_post(context: ContextTypes.DEFAULT_TYPE, board: str, thread: str,
     num = post.get("num")
     raw_comment = post.get("comment", "")
     internal_chat_id = get_internal_chat_id()
-    domain = thread_domain(info)
-    caption = _build_caption(board, thread, post, msg_ids, internal_chat_id, domain=domain)
+    caption = _build_caption(board, thread, post, msg_ids, internal_chat_id)
 
     # Кнопку "показать оригинал" имеет смысл предлагать только когда пост
     # реально отправлен превьюшками — в режиме full и так шлём оригиналы.
@@ -715,7 +681,7 @@ async def send_post(context: ContextTypes.DEFAULT_TYPE, board: str, thread: str,
     # 2. Одно вложение
     if len(files) == 1:
         f = files[0]
-        url = file_url(f, mode, domain)
+        url = file_url(f, mode)
         if is_full_video_send(f, mode):
             try:
                 sent = await _send_with_reply_fallback(
@@ -731,7 +697,7 @@ async def send_post(context: ContextTypes.DEFAULT_TYPE, board: str, thread: str,
                 return
             except Exception as e:
                 logger.warning("Не удалось отправить видео %s, фолбэк на превью-картинку: %s", url, e)
-                url = f"{domain}{f['thumbnail']}"  # фолбэк на превью, а не на тот же .webm/.mp4 как фото
+                url = f"{active_domain()}{f['thumbnail']}"  # фолбэк на превью, а не на тот же .webm/.mp4 как фото
 
         try:
             sent = await _send_with_reply_fallback(
@@ -759,7 +725,7 @@ async def send_post(context: ContextTypes.DEFAULT_TYPE, board: str, thread: str,
     for chunk_idx, chunk in enumerate(chunks):
         media_group = []
         for file_idx, f in enumerate(chunk):
-            url = file_url(f, mode, domain)
+            url = file_url(f, mode)
             item_caption = caption if (chunk_idx == 0 and file_idx == 0) else None
             parse_mode = ParseMode.HTML if item_caption else None
 
@@ -800,7 +766,7 @@ async def send_post(context: ContextTypes.DEFAULT_TYPE, board: str, thread: str,
                         logger.warning("Не удалось отправить кнопку 'показать оригинал' для альбома: %s", e)
         except Exception as e:
             logger.warning("Не удалось отправить media_group: %s. Отправляю фолбэк-текстом.", e)
-            file_links = "\n".join(file_url(f, mode, domain) for f in chunk)
+            file_links = "\n".join(file_url(f, mode) for f in chunk)
             sent = await context.bot.send_message(
                 chat_id=USER_ID, text=f"{caption}\n\nФайлы:\n{file_links}", parse_mode=ParseMode.HTML,
             )
@@ -822,7 +788,7 @@ async def check_new_posts(context: ContextTypes.DEFAULT_TYPE) -> None:
             continue
 
         board, thread = info["board"], info["thread"]
-        thread_json = await asyncio.to_thread(fetch_thread, board, thread, info)
+        thread_json = await asyncio.to_thread(fetch_thread, board, thread)
         if thread_json is None:
             continue
 
@@ -886,7 +852,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• <code>/reply Текст вашего ответа</code> — цитата &gt;&gt;номер подставится автоматически\n"
         "• <code>/post &lt;ссылка&gt; Текст</code> — создать пост в указанном треде\n"
         "• <b>✏️ Новый пост</b> — кнопка под последним постом треда: нажмите и просто "
-        "отправьте следующее сообщение (текст/фото/видео) — оно уйдёт постом. "
+        "отправьте следующее сообщение (текст/фото/видео/стикер) — оно уйдёт постом. "
         "<code>/cancel</code> отменяет ожидание\n"
         "• Имя и тема поста — флагами в конце текста: "
         "<code>Текст поста --name Аноним2 --subject Заголовок</code>\n"
@@ -1012,11 +978,7 @@ async def cmd_watch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    # Пробный dict для перехвата домена, с которого тред реально ответил —
-    # запоминаем его в state, чтобы потом все URL медиа/ссылок и кнопка
-    # «Показать оригинал» строились именно от этого зеркала (.su/.org/.life).
-    probe: dict = {}
-    thread_json = await asyncio.to_thread(fetch_thread, board, thread, probe)
+    thread_json = await asyncio.to_thread(fetch_thread, board, thread)
     posts = get_posts(thread_json) if thread_json else []
     if not posts:
         await context.bot.send_message(
@@ -1026,7 +988,6 @@ async def cmd_watch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    thread_domain_added = probe.get("domain") or active_domain()
     mode = STATE.get("mode", "preview")
 
     if load_all:
@@ -1039,7 +1000,6 @@ async def cmd_watch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         STATE["threads"][key] = {
             "board": board,
             "thread": thread,
-            "domain": thread_domain_added,
             "last_num": posts[0]["num"] if posts else 0,
             "msg_ids": {},
             "loading_history": True,
@@ -1071,7 +1031,6 @@ async def cmd_watch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         STATE["threads"][key] = {
             "board": board,
             "thread": thread,
-            "domain": thread_domain_added,
             "last_num": posts[-1]["num"],
             "msg_ids": {},
         }
@@ -1267,7 +1226,7 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     lines = ["<b>📋 Отслеживаемые треды:</b>\n"]
     for info in threads.values():
-        link = f"{thread_domain(info)}/{info['board']}/res/{info['thread']}.html"
+        link = f"{active_domain()}/{info['board']}/res/{info['thread']}.html"
         last = info.get("last_num", "—")
         k = thread_key(info["board"], info["thread"])
         status_tag = ""
@@ -1344,7 +1303,7 @@ async def on_newpost_button(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             text=(
                 f"🔀 Ожидание переключено: пишу теперь в тред <b>/{board}/{thread}</b> "
                 f"вместо <b>/{existing['board']}/{existing['thread']}</b>.\n"
-                f"Отправьте текст, фото или видео. Отменить: /cancel"
+                f"Отправьте текст, фото, видео или стикер. Отменить: /cancel"
             ),
             parse_mode=ParseMode.HTML,
         )
@@ -1356,7 +1315,7 @@ async def on_newpost_button(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     sent = await context.bot.send_message(
         chat_id=chat_id,
         text=(
-            f"✍️ Жду текст, фото или видео для нового поста в тред <b>/{board}/{thread}</b>.\n"
+            f"✍️ Жду текст, фото, видео или стикер для нового поста в тред <b>/{board}/{thread}</b>.\n"
             f"Просто отправьте следующее сообщение — как обычно, перед публикацией нужно "
             f"будет решить капчу, так что случайно ничего не улетит.\n\n"
             f"Чтобы отменить ожидание: /cancel"
@@ -1496,7 +1455,7 @@ def get_dvach_session() -> requests.Session:
         "Accept": "*/*",
         "Accept-Language": "ru,en-US;q=0.9,en;q=0.8",
     })
-    for d in [".2ch.su", ".2ch.org", ".2ch.life"]:
+    for d in [".2ch.su", ".2ch.org", ".2ch.life", ".2ch.hk"]:
         s.cookies.set("ageallow", "1", domain=d)
     return s
 
@@ -2051,9 +2010,7 @@ async def on_draft_continue(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     truncated_notice = draft.get("truncated_notice", "")
     chat_id = draft["chat_id"]
 
-    # Публикуем на домен того же треда, что отслеживается (если он есть в state),
-    # иначе — на последнее глобально рабочее зеркало. 2ch.hk из перебора исключён.
-    domain = thread_domain(STATE.get("threads", {}).get(thread_key(board, thread)))
+    domain = active_domain()
     http_s = get_dvach_session()
 
     status_msg = await query.edit_message_text(
@@ -2195,12 +2152,53 @@ def _pick_caption_message(messages: list):
     return messages[0]
 
 
+def _image_to_png(raw: bytes) -> bytes:
+    """Любую растровую картинку (WEBP-стикер, превью-WEBP/JPEG) -> PNG.
+    Прозрачность стикеров сохраняется. Синхронная — вызывать через asyncio.to_thread."""
+    img = Image.open(io.BytesIO(raw)).convert("RGBA")
+    out = io.BytesIO()
+    img.save(out, format="PNG")
+    return out.getvalue()
+
+
+async def _extract_sticker(context: ContextTypes.DEFAULT_TYPE, sticker) -> Optional[Tuple[bytes, str, bool]]:
+    """Стикер -> файл, который сможет принять 2ch:
+      • видеостикер (WEBM) — отправляется как есть;
+      • анимированный (TGS, Lottie) — эту анимацию нигде, кроме Telegram, не показать,
+        поэтому берём статичное превью стикера (thumbnail) и конвертируем в PNG;
+      • обычный (WEBP) — конвертируем в PNG, чтобы не зависеть от того, принимает ли
+        2ch формат WEBP.
+    Имени файла у стикеров нет — has_original_name всегда False."""
+    ts = int(time.time())
+
+    if sticker.is_video:
+        tg_file = await context.bot.get_file(sticker.file_id)
+        data = bytes(await tg_file.download_as_bytearray())
+        return data, f"sticker_{ts}.webm", False
+
+    if sticker.is_animated:
+        thumb = sticker.thumbnail
+        if not thumb:
+            logger.warning("У анимированного стикера нет превью — пропускаю.")
+            return None
+        file_id = thumb.file_id
+    else:
+        file_id = sticker.file_id
+
+    tg_file = await context.bot.get_file(file_id)
+    raw = bytes(await tg_file.download_as_bytearray())
+    png = await asyncio.to_thread(_image_to_png, raw)
+    return png, f"sticker_{ts}.png", False
+
+
 async def _extract_one_file(context: ContextTypes.DEFAULT_TYPE, message) -> Optional[Tuple[bytes, str, bool]]:
-    """Достаёт файл (фото/видео/gif/подходящий документ) из ОДНОГО Telegram-сообщения,
+    """Достаёт файл (фото/видео/gif/стикер/подходящий документ) из ОДНОГО Telegram-сообщения,
     если он там есть. Возвращает (file_data, file_name, has_original_name) или None.
     has_original_name=True только если Telegram реально передал исходное имя файла —
     у сжатых фото (PhotoSize) такого имени нет в принципе, Telegram стирает все
     метаданные на своей стороне ещё до того, как что-либо попадает к боту."""
+    if message.sticker:
+        return await _extract_sticker(context, message.sticker)
     if message.photo:
         largest = message.photo[-1]
         tg_file = await context.bot.get_file(largest.file_id)
@@ -2555,7 +2553,7 @@ async def on_show_full(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await query.message.reply_text("❌ Этот тред больше не отслеживается.")
         return
 
-    thread_json = await asyncio.to_thread(fetch_thread, board, thread, info)
+    thread_json = await asyncio.to_thread(fetch_thread, board, thread)
     if not thread_json:
         await query.message.reply_text("❌ Не удалось получить тред с 2ch (возможно, удалён или недоступен).")
         return
@@ -2570,19 +2568,14 @@ async def on_show_full(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await query.message.reply_text("В этом посте больше нет вложений.")
         return
 
-    # Все URL оригиналов строим от домена ИМЕННО этого треда (с которого он был
-    # добавлен и реально читается — .su / .org / .life), а не от глобального
-    # зеркала. Так кнопка «Показать оригинал» больше не дёргает мёртвый 2ch.hk.
-    domain = thread_domain(info)
-
     # editMessageMedia стирает caption, если явно не передать его заново —
     # поэтому пересобираем тот же самый текст, что был при первой отправке поста.
     msg_ids = info.get("msg_ids", {})
     internal_chat_id = get_internal_chat_id()
-    caption = _build_caption(board, thread, post, msg_ids, internal_chat_id, domain=domain)
+    caption = _build_caption(board, thread, post, msg_ids, internal_chat_id)
 
     def _full_media(f: dict, with_caption: bool = False):
-        url = file_url(f, "full", domain)
+        url = file_url(f, "full")
         kwargs: dict = {"media": url}
         if with_caption:
             kwargs["caption"] = caption
@@ -2622,7 +2615,7 @@ async def on_show_full(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             )
     except Exception as e:
         logger.warning("Не удалось показать оригинал поста #%s: %s", num_str, e)
-        links = "\n".join(file_url(f, "full", domain) for f in files)
+        links = "\n".join(file_url(f, "full") for f in files)
         await query.message.reply_text(f"❌ Не удалось загрузить оригинал напрямую. Ссылки:\n{links}")
 
 
@@ -2771,7 +2764,7 @@ def main() -> None:
     # просто не матчится, и апдейт уходит дальше остальным хэндлерам.
     pending_post_media_filter = (
         filters.TEXT | filters.PHOTO | filters.VIDEO | filters.VIDEO_NOTE | filters.ANIMATION
-        | filters.Document.IMAGE | filters.Document.VIDEO
+        | filters.Sticker.ALL | filters.Document.IMAGE | filters.Document.VIDEO
     )
     app.add_handler(MessageHandler(
         PENDING_POST_FILTER & pending_post_media_filter & ~filters.COMMAND, on_pending_post_message
@@ -2803,6 +2796,7 @@ def main() -> None:
         | filters.VIDEO
         | filters.VIDEO_NOTE
         | filters.ANIMATION
+        | filters.Sticker.ALL
         | filters.Document.IMAGE
         | filters.Document.VIDEO
     )
